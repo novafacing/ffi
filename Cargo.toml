@@ -27,3 +27,8 @@ darling = "0.20.3"
 [dev-dependencies]
 anyhow = "1.0.75"
 trybuild = "1.0.85"
+
+[build-dependencies]
+anyhow = "1.0.75"
+cc = "1.0.83"
+command-ext = "0.1.1"

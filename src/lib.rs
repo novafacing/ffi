@@ -95,6 +95,17 @@ impl FfiMethodOpts {
     }
 }
 
+struct FfiFuncRename {
+    rename: String,
+    _ty: Box<Type>,
+}
+
+struct FfiFuncArgs {
+    name: Option<TokenStream2>,
+    args: Vec<TokenStream2>,
+    renames: HashMap<usize, FfiFuncRename>,
+}
+
 #[derive(Debug)]
 struct FfiMethods<'a> {
     ffi_self_ty: Option<Type>,
@@ -205,11 +216,7 @@ impl<'a> FfiMethods<'a> {
     fn ffi_func_args(
         &self,
         method: &WithOriginal<FfiMethodOpts, ImplItemFn>,
-    ) -> Result<(
-        Option<TokenStream2>,
-        Vec<TokenStream2>,
-        HashMap<usize, (String, Box<Type>)>,
-    )> {
+    ) -> Result<FfiFuncArgs> {
         let impl_method_args = method.original.sig.inputs.iter().collect::<Vec<_>>();
         let impl_method_args_no_receiver = method
             .original
@@ -219,9 +226,9 @@ impl<'a> FfiMethods<'a> {
             .filter(|a| !matches!(a, FnArg::Receiver(_)))
             .cloned()
             .collect::<Vec<_>>();
-        let mut ffi_receiver_name = None;
-        let mut ffi_func_args = Vec::new();
-        let mut ffi_func_renames = HashMap::new();
+        let mut name = None;
+        let mut args = Vec::new();
+        let mut renames = HashMap::new();
 
         for (i, arg) in method.parsed.arg.iter().enumerate() {
             if arg.receiver.is_present() {
@@ -237,7 +244,7 @@ impl<'a> FfiMethods<'a> {
                     quote!(#ty)
                 };
 
-                let name = arg
+                let arg_name = arg
                     .rename
                     .as_ref()
                     .map(|n| {
@@ -245,30 +252,30 @@ impl<'a> FfiMethods<'a> {
                         quote!(#n)
                     })
                     .unwrap_or(quote!(slf));
-                ffi_func_args.push(quote!(#name: #ty));
-                ffi_receiver_name = Some(name);
+                args.push(quote!(#arg_name: #ty));
+                name = Some(arg_name);
             } else if arg.rest.is_present() {
                 // If we have already seen the receiver argument, we need to look one
                 // argument forward
                 let mut arg_index = i;
 
-                if ffi_receiver_name.is_none() {
+                if name.is_none() {
                     arg_index += 1;
                 }
 
-                ffi_func_args.extend(
+                args.extend(
                     impl_method_args_no_receiver
                         .iter()
                         .enumerate()
                         .filter_map(|(i, a)| (i >= arg_index - 1).then_some(a))
                         .map(|a| quote!(#a)),
                 );
-            } else if ffi_func_args.len() <= impl_method_args_no_receiver.len() + 1 {
+            } else if args.len() <= impl_method_args_no_receiver.len() + 1 {
                 // If we have already seen the receiver argument, we need to look one
                 // argument forward
                 let mut arg_index = i;
 
-                if ffi_receiver_name.is_none() {
+                if name.is_none() {
                     arg_index += 1;
                 }
 
@@ -281,13 +288,19 @@ impl<'a> FfiMethods<'a> {
 
                 let ty = &impl_method_arg_pat_type.ty;
                 if let Some(ref rename) = arg.rename {
-                    ffi_func_renames.insert(i, (rename.clone(), ty.clone()));
-                    ffi_func_args.push({
+                    renames.insert(
+                        i,
+                        FfiFuncRename {
+                            rename: rename.clone(),
+                            _ty: ty.clone(),
+                        },
+                    );
+                    args.push({
                         let rename = format_ident!("{rename}");
                         quote!(#rename: #ty)
                     });
                 } else {
-                    ffi_func_args.push(quote!(#impl_method_arg_pat_type));
+                    args.push(quote!(#impl_method_arg_pat_type));
                 }
             } else {
                 return Err(Error::custom(
@@ -296,14 +309,18 @@ impl<'a> FfiMethods<'a> {
             }
         }
 
-        Ok((ffi_receiver_name, ffi_func_args, ffi_func_renames))
+        Ok(FfiFuncArgs {
+            name,
+            args,
+            renames,
+        })
     }
 
     fn ffi_method_call(
         &self,
         method: &WithOriginal<FfiMethodOpts, ImplItemFn>,
         ffi_receiver_name: &Option<TokenStream2>,
-        ffi_func_renames: &HashMap<usize, (String, Box<Type>)>,
+        ffi_func_renames: &HashMap<usize, FfiFuncRename>,
         need_expect: bool,
     ) -> TokenStream2 {
         let impl_method_args_no_receiver = method
@@ -326,8 +343,8 @@ impl<'a> FfiMethods<'a> {
         let impl_method_name = &method.original.sig.ident;
         let mut impl_method_call_args = Vec::new();
         for (i, arg) in impl_method_args_no_receiver.iter().enumerate() {
-            if let Some((rename, _ty)) = ffi_func_renames.get(&i) {
-                let ident = format_ident!("{rename}");
+            if let Some(rename) = ffi_func_renames.get(&i) {
+                let ident = format_ident!("{}", rename.rename);
                 impl_method_call_args.push(quote!(#ident));
             } else {
                 let FnArg::Typed(ref typed) = arg else {
@@ -358,7 +375,7 @@ impl<'a> FfiMethods<'a> {
 
     fn ffi_method(&self, method: &WithOriginal<FfiMethodOpts, ImplItemFn>) -> Result<TokenStream2> {
         let ffi_func_name = self.ffi_func_name(method);
-        let (ffi_receiver_name, ffi_func_args, ffi_func_renames) = self.ffi_func_args(method)?;
+        let ffi_func_args = self.ffi_func_args(method)?;
 
         let (_impl_method_return_ty, ffi_func_return_ty, need_expect) = Self::ffi_return_ty(
             &method.original.sig.output,
@@ -377,8 +394,8 @@ impl<'a> FfiMethods<'a> {
         let mut impl_method_call_args = Vec::new();
 
         for (i, arg) in impl_method_args_no_receiver.iter().enumerate() {
-            if let Some((rename, _ty)) = ffi_func_renames.get(&i) {
-                let ident = format_ident!("{rename}");
+            if let Some(rename) = ffi_func_args.renames.get(&i) {
+                let ident = format_ident!("{}", rename.rename);
                 impl_method_call_args.push(quote!(#ident));
             } else {
                 let FnArg::Typed(ref typed) = arg else {
@@ -397,8 +414,13 @@ impl<'a> FfiMethods<'a> {
         let ffi_func_visibility = method.parsed.visibility();
         let (_self_impl_genrics, self_ty_generics, self_where_clause) = &self.self_generics;
 
-        let impl_method_call =
-            self.ffi_method_call(method, &ffi_receiver_name, &ffi_func_renames, need_expect);
+        let impl_method_call = self.ffi_method_call(
+            method,
+            &ffi_func_args.name,
+            &ffi_func_args.renames,
+            need_expect,
+        );
+        let ffi_func_args = ffi_func_args.args;
 
         Ok(quote! {
             #[no_mangle]
@@ -671,7 +693,140 @@ impl FfiOpts {
 
 #[proc_macro_attribute]
 #[proc_macro_error]
+/// Wrap an `impl` block with `#[ffi(...)]` to generate FFI functions for all methods in the `impl`
+/// block.
 ///
+/// # Arguments
+///
+/// The `impl`-level `ffi` attribute accepts the following parameters:
+///
+/// * `mod_name`: The name of the module to create to contain the FFI functions.
+///   Defaults to the name of the type being implemented, converted to lowercase. For
+///   example `name = "vec3_mod"`.
+/// * `visibility`: The visibility of the module to create to contain the FFI functions.
+///   Defaults to `pub`. For example `visibility = "pub(crate)"`.
+/// * `self_ty`: The self type to use for the receiver argument for all methods.
+///   Defaults to a mut pointer to the type being implemented. For example `self_ty =
+///   "*mut std::ffi::c_void"`.
+/// * `expect`: If the method returns a `Result`, whether to call `.expect` on the
+///   result. Defaults to `false`. For example `expect`.
+/// * `from_ptr`: Whether to generate `From<T>` where T is the type specified in
+///   `self_ty`. Defaults to `false`. For example `from_ptr`. If not specified, a manual
+///   implementation must be provided.
+/// * `from_any_ptr`: Whether to generate `From<*mut T>`. Defaults to `false`. For
+///   example `from_any_ptr`. If not specified, a manual implementation must be provided.
+///
+/// For example, an impl-level attribute specifying that a public module named `my_ffi_mod`,
+/// containing FFI functions for all methods in the `Vec3` impl block, should be generated,
+/// with the receiver type `*mut std::ffi::c_void` and that methods which return a `Result`
+/// should be `.expect`-ed and a `From<*mut std::ffi::c_void>` implementation should be
+/// generated, would look like:
+///
+/// ```rust,ignore
+/// #[ffi(mod_name = "my_ffi_mod", self_ty = "*mut std::ffi::c_void", expect, from_ptr)]
+/// ```
+///
+/// The method-level `ffi` attribute accepts the following parameters:
+///
+/// * `expect`: If the method returns a `Result`, whether to call `.expect` on the
+///   result. Defaults to `false`. For example `expect`. If not specified on the `impl` level
+///   attribute, the module level attribute takes precedence.
+/// * `visibility`: The visibility of the generated FFI function. Defaults to `pub`.
+///   For example `visibility = "pub(crate)"`.
+/// * `name`: The name of the generated FFI function. Defaults to the name of the method
+///   being implemented. For example `name = "vec3_add"`.
+/// * `arg`: Can be specified multiple times. The arguments to the generated FFI function.
+///
+/// For example, a method-level attribute specifying that a public FFI function named
+/// `vec3_add` should be generated, which takes its receiver as the last argument and that
+/// methods which return a `Result` should be `.expect`-ed, would look like:
+///
+/// ```rust,ignore
+/// #[ffi(arg(), arg(), arg(), arg(self), expect, name = "vec3_add")]
+/// fn vec3_add(&mut self, x: i32, y: i32, z: i32) { /* */ }
+/// ```
+///
+/// The argument-level `arg` attribute accepts the following parameters:
+///
+/// * `self`: Whether this argument needs to be converted to the receiver type. Defaults
+///   to `false`. For example `self`.
+/// * `rest`: Whether this argument is the rest of the arguments. Defaults to `false`.
+///   After `rest` is specified, no other `arg` attributes may be specified.
+/// * `ty`: The type to convert this argument to. Defaults to the type of the argument.
+///   For example `ty = "i32"`. A valid `From` implementation must exist for this type.
+/// * `rename`: The name of the argument in the generated FFI function. Defaults to the
+///   name of the argument. For example `rename = "x"`.
+///
+/// An empty `arg()` specifies only the position of an argument. In the following example, we
+/// specify that the FFI function should receive the first three non-receiver arguments, then
+/// the receiver argument.
+///
+/// ```rust,ignore
+/// #[ffi(arg(), arg(), arg(), arg(self))]
+/// fn vec3_add(&mut self, x: i32, y: i32, z: i32) { /* */ }
+/// ```
+///
+/// This is equivalent to:
+///
+/// ```rust,ignore
+/// #[ffi(arg(rest), arg(self))]
+/// fn vec3_add(&mut self, x: i32, y: i32, z: i32) { /* */ }
+/// ```
+///
+/// Likewise:
+///
+/// ```rust,ignore
+/// #[ffi(arg(self), arg(), arg(), arg())]
+/// fn vec3_add(&mut self, x: i32, y: i32, z: i32) { /* */ }
+/// ```
+///
+/// is equivalent to:
+///
+/// ```rust,ignore
+/// #[ffi(arg(self), arg(rest))]
+/// fn vec3_add(&mut self, x: i32, y: i32, z: i32) { /* */ }
+/// ```
+///
+/// # Example
+///
+/// The simple use case, where a callback we specify is called with user data we specify.
+///
+/// ```rust
+/// use ffi::ffi;
+///
+/// extern "C" fn run_callback(
+///     callback: extern "C" fn(*mut std::ffi::c_void, i32, i32, i32) -> i32,
+///     data: *mut std::ffi::c_void,
+/// ) -> i32 {
+///     callback(data, 1, 2, 3)
+/// }
+///
+/// #[derive(Debug, Clone, PartialEq, Eq)]
+/// struct Vec3 {
+///     x: i32,
+///     y: i32,
+///     z: i32,
+/// }
+///
+/// #[ffi(from_ptr, self_ty = "*mut std::ffi::c_void")]
+/// impl Vec3 {
+///     #[ffi(arg(self), arg(rest))]
+///     fn add(&mut self, x: i32, y: i32, z: i32) -> i32 {
+///         self.x += x;
+///         self.y += y;
+///         self.z += z;
+///         self.x + self.y + self.z
+///     }
+/// }
+///
+/// fn main() {
+///     let mut v = Vec3 { x: 1, y: 2, z: 3 };
+///
+///     run_callback(vec3::add, &mut v as *mut Vec3 as *mut _);
+///
+///     assert_eq!(v, Vec3 { x: 2, y: 4, z: 6 })
+/// }
+/// ```
 pub fn ffi(args: TokenStream, input: TokenStream) -> TokenStream {
     let meta = match NestedMeta::parse_meta_list(args.into()) {
         Ok(o) => o,
