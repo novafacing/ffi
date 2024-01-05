@@ -1,3 +1,6 @@
+// Copyright (C) 2023-2024 Intel Corporation, Rowan Hart
+// SPDX-License-Identifier: Apache-2.0
+
 //! The `ffi` macro allows you to easily export FFI interfaces for your Rust code with minimal
 //! boilerplate. It is designed to facilitate several unique use cases which commonly occur in
 //! FFI code, particularly where a Rust shared library is `dlopen`ed by a C program and called
@@ -669,24 +672,23 @@ impl FfiOpts {
     }
 
     fn module_name(&self, input: &ItemImpl) -> TokenStream2 {
-        match self.name.as_ref().map(|n| {
-            let n = format_ident!("{n}");
-            quote!(#n)
+        if let Some(name) = self.name.as_ref().map(|n| {
+            let name = format_ident!("{n}");
+            quote!(#name)
         }) {
-            Some(n) => n,
-            None => {
-                let Type::Path(path) = input.self_ty.as_ref() else {
-                    abort!(input, "Implementation self type is not a path");
-                };
+            name
+        } else {
+            let Type::Path(path) = input.self_ty.as_ref() else {
+                abort!(input, "Implementation self type is not a path");
+            };
 
-                let Some(name) = path.path.segments.first() else {
-                    abort!(path, "Path has no segments");
-                };
+            let Some(name) = path.path.segments.first() else {
+                abort!(path, "Path has no segments");
+            };
 
-                let ffi_mod_name = format_ident!("{}", name.ident.to_string().to_ascii_lowercase());
+            let ffi_mod_name = format_ident!("{}", name.ident.to_string().to_ascii_lowercase());
 
-                quote!(#ffi_mod_name)
-            }
+            quote!(#ffi_mod_name)
         }
     }
 }

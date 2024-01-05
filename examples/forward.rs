@@ -1,3 +1,6 @@
+// Copyright (C) 2024 Rowan Hart
+// SPDX-License-Identifier: Apache-2.0
+
 use ffi::ffi;
 
 extern "C" fn run_callback(
